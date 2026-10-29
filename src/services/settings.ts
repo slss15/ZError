@@ -10,8 +10,10 @@ export interface AppSettings {
   
   // 题库设置
   autoAddToQuestionBank: boolean
-  // 文本模型最长响应时间（秒）
+  // 文本模型无新内容超时（秒）
   modelResponseTimeout: number
+  // 单题绝对等待上限（秒）
+  modelAbsoluteTimeout: number
   // 模型失败自动重试次数（仅单模型 / 总结模型 / 视觉模型）；0 表示不重试
   modelRetryCount: number
 
@@ -49,6 +51,8 @@ export interface AppSettings {
     users: UserConfig[]
   }
   search: SearchSettings
+  // 诊断日志
+  diagnosticLogging: boolean
 }
 
 export interface UserConfig {
@@ -87,6 +91,8 @@ export interface SearchSettings {
   localCommand: string
   localArgs: string
   localEnv: string
+  /** 搜索失败/超时后是否继续作答；false 时直接返回错误 */
+  failOpen: boolean
 }
 
 export const DEFAULT_SEARCH_SETTINGS: SearchSettings = {
@@ -102,7 +108,8 @@ export const DEFAULT_SEARCH_SETTINGS: SearchSettings = {
   extraArguments: '',
   localCommand: '',
   localArgs: '',
-  localEnv: ''
+  localEnv: '',
+  failOpen: true
 }
 
 // 默认设置
@@ -112,7 +119,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   autoSave: true,
   autoAddToQuestionBank: true,
   modelResponseTimeout: 40,
+  modelAbsoluteTimeout: 300,
   modelRetryCount: 2,
+  diagnosticLogging: true,
 
   defaultDifficulty: 'medium',
   itemsPerPage: 20,
@@ -411,8 +420,10 @@ class SettingsManager {
       language: '应用界面语言',
       autoSave: '自动保存设置',
       autoAddToQuestionBank: '自动将AI返回的题目添加到本地题库',
-      modelResponseTimeout: '文本模型最长响应时间（秒）',
+      modelResponseTimeout: '模型无新内容超时（秒）',
+      modelAbsoluteTimeout: '单题绝对等待上限（秒）',
       modelRetryCount: '模型失败自动重试次数',
+      diagnosticLogging: '记录诊断日志',
 
       network: '网络配置设置',
       windowSize: '窗口大小',

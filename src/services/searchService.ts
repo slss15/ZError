@@ -31,6 +31,12 @@ export interface SearchTrace {
   results: SearchResultItem[]
   rawText?: string
   error?: string
+  /** 搜索结果是否真正注入了模型 prompt */
+  injected: boolean
+  /** 注入到了哪些模型类型 */
+  injectedTo: Array<'text' | 'summary' | 'vision'>
+  /** 注入的搜索上下文长度 */
+  contextChars: number
 }
 
 const MCP_PROTOCOL_VERSION = '2025-03-26'

@@ -194,10 +194,21 @@ async fn run_stdio_search(
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(60).clamp(5, 300));
 
     let mut child_command = if cfg!(target_os = "windows") {
-        // Windows 下 npx / node 等通常是 .cmd，通过 cmd /C 启动最稳妥
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg(&command);
-        cmd
+        // .cmd/.bat（npx、npm 等）必须通过 cmd /C；node/python 等 exe 直接启动，
+        // 避免 cmd 中转导致 stdin 管道行为不一致。
+        let lower = command.to_ascii_lowercase();
+        let needs_shell = lower.ends_with(".cmd")
+            || lower.ends_with(".bat")
+            || lower == "npx"
+            || lower == "npm"
+            || command.contains(' ');
+        if needs_shell {
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/C").arg(&command);
+            cmd
+        } else {
+            Command::new(&command)
+        }
     } else {
         Command::new(&command)
     };

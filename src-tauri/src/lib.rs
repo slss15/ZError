@@ -5,6 +5,7 @@
 pub mod app_activity;
 pub mod commands;
 pub mod database;
+pub mod diagnostics;
 pub mod logger;
 pub mod mcp;
 pub mod server;
@@ -26,6 +27,7 @@ pub use database::{
     clear_folder_questions, delete_folder, delete_question, delete_questions, move_folder,
     rename_folder,
 };
+pub use diagnostics::{append_diagnostic_log, get_log_dir, open_log_dir};
 pub use mcp::{mcp_stdio_cancel, mcp_stdio_prepare, mcp_stdio_search};
 pub use server::{get_server_status, start_server, stop_server};
 use tauri::Manager;
@@ -268,6 +270,9 @@ pub fn run() {
             mcp_stdio_search,
             mcp_stdio_prepare,
             mcp_stdio_cancel,
+            append_diagnostic_log,
+            get_log_dir,
+            open_log_dir,
             read_config,
             write_config,
             read_model_config,
@@ -389,6 +394,9 @@ pub fn run() {
                 .resizable(true)
                 .decorations(true)
                 .title_bar_style(tauri::TitleBarStyle::Overlay)
+                .background_throttling(
+                    tauri::utils::config::BackgroundThrottlingPolicy::Disabled,
+                )
                 .build();
                 
             #[cfg(not(target_os = "macos"))]
@@ -397,15 +405,27 @@ pub fn run() {
                 let window_icon =
                     tauri::image::Image::from_bytes(include_bytes!("../icons/128x128@2x.png"))
                         .expect("window icon png");
-                let built = tauri::WebviewWindowBuilder::new(app, "main", url)
+                let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
                     .title("ZError")
                     .inner_size(main_window_size.width, main_window_size.height)
                     .min_inner_size(main_window_size.min_width, main_window_size.min_height)
                     .center()
                     .resizable(true)
-                    .decorations(false)
-                    .icon(window_icon)?
-                    .build();
+                    .decorations(false);
+
+                // Windows: WebView2 在窗口最小化/被遮挡时会节流或挂起渲染线程，
+                // 导致前端模型调用和最终响应上报延迟。这里关闭相关后台节流。
+                #[cfg(windows)]
+                {
+                    builder = builder.additional_browser_args(
+                        "--disable-background-timer-throttling \
+                         --disable-renderer-backgrounding \
+                         --disable-backgrounding-occluded-windows \
+                         --disable-features=CalculateNativeWinOcclusion,msWebOOUI,msPdfOOUI,msSmartScreenProtection",
+                    );
+                }
+
+                let built = builder.icon(window_icon)?.build();
                 #[cfg(windows)]
                 if let Ok(ref win) = built {
                     apply_windows_taskbar_icons(win);

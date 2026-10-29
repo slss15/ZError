@@ -170,6 +170,7 @@ const buildCommonHelpers = () => `
 
     const decoder = new TextDecoder();
     let buffer = '';
+    let finished = false;
 
     const flush = async function* (chunkText) {
       const blocks = chunkText.split(/\\n\\n+/);
@@ -188,18 +189,49 @@ const buildCommonHelpers = () => `
         if (!dataLines.length) continue;
 
         const data = dataLines.join('\\n');
-        if (!data || data === '[DONE]') continue;
+        if (!data) continue;
+        if (data === '[DONE]') {
+          finished = true;
+          continue;
+        }
 
+        let payload;
         try {
-          yield JSON.parse(data);
-        } catch {}
+          payload = JSON.parse(data);
+        } catch {
+          continue;
+        }
+
+        yield payload;
+
+        const eventType = payload && typeof payload.type === 'string' ? payload.type : '';
+        const hasFinishReason = !!(payload && Array.isArray(payload.choices) && payload.choices.some(
+          (choice) => choice && choice.finish_reason
+        ));
+        if (
+          eventType === 'message_stop' ||
+          eventType === 'response.completed' ||
+          eventType === 'response.failed' ||
+          hasFinishReason
+        ) {
+          finished = true;
+          return;
+        }
       }
     };
 
     while (true) {
+      if (finished) {
+        try { await reader.cancel(); } catch {}
+        return;
+      }
       const { value, done } = await reader.read();
       buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
       yield* flush(buffer);
+      if (finished) {
+        try { await reader.cancel(); } catch {}
+        return;
+      }
 
       if (done) {
         if (buffer.trim()) {

@@ -80,8 +80,8 @@
     <div class="setting-item">
 
       <div class="setting-info">
-        <h3 class="setting-title">模型最长响应时间</h3>
-        <p class="setting-description">AI 模型单次请求超时（秒）。超时后中止该次调用并可按「失败自动重试次数」重试；整题最长等待 ≈ 本值 × (1+重试) + 缓冲。默认 40 秒。</p>
+        <h3 class="setting-title">模型无新内容超时</h3>
+        <p class="setting-description">模型多久没有输出新内容就判定超时（秒）。只要持续有 content/reasoning 就会自动续期；默认 40 秒。</p>
       </div>
       <div class="setting-control timeout-control">
         <input
@@ -92,6 +92,24 @@
           max="600"
           step="5"
           @change="handleSettingChange('modelResponseTimeout', Number(($event.target as HTMLInputElement).value))"
+        />
+        <span class="timeout-unit">秒</span>
+      </div>
+    </div>
+    <div class="setting-item">
+      <div class="setting-info">
+        <h3 class="setting-title">单题绝对等待上限</h3>
+        <p class="setting-description">一次答题从收到请求到最终返回的硬上限（秒）。防止异常流或后台挂起无限等待，默认 300 秒。</p>
+      </div>
+      <div class="setting-control timeout-control">
+        <input
+          type="number"
+          class="form-input"
+          :value="settings.modelAbsoluteTimeout ?? 300"
+          min="30"
+          max="1800"
+          step="10"
+          @change="handleSettingChange('modelAbsoluteTimeout', Math.max(30, Math.min(1800, Number(($event.target as HTMLInputElement).value) || 300)))"
         />
         <span class="timeout-unit">秒</span>
       </div>

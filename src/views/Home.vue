@@ -201,6 +201,10 @@
             @click="activeTab = 'search'">
             联网搜索
           </button>
+          <button class="tab-button" :class="{ active: activeTab === 'diagnostic' }"
+            @click="activeTab = 'diagnostic'">
+            诊断
+          </button>
           <button class="tab-button" :class="{ active: activeTab === 'requestBody' }"
             @click="activeTab = 'requestBody'">
             请求体
@@ -309,6 +313,9 @@
                   <span>{{ trace.mode === 'local' ? '本地 stdio' : '远程 HTTP' }}</span>
                   <span>{{ trace.toolName }}</span>
                   <span v-if="trace.durationMs !== undefined">{{ trace.durationMs }}ms</span>
+                  <span :class="['search-injection-badge', trace.injected ? 'ok' : 'missing']">
+                    {{ trace.injected ? `已注入 ${trace.contextChars} 字` : '未注入' }}
+                  </span>
                 </div>
 
                 <div class="search-trace-query">{{ trace.query }}</div>
@@ -349,6 +356,53 @@
             <div v-else class="no-data">
               <span class="no-data-text">本次请求没有联网搜索记录</span>
             </div>
+          </div>
+
+          <!-- 诊断 -->
+          <div v-if="activeTab === 'diagnostic'" class="detail-section">
+            <div v-if="selectedLog" class="diagnostic-panel">
+              <div class="diagnostic-summary">
+                <span class="diagnostic-chip">阶段：{{ selectedLog.phase || '未知' }}</span>
+                <span class="diagnostic-chip" :class="{ ok: selectedLog.searchUsed }">
+                  搜索：{{ selectedLog.searchUsed ? '已使用' : (selectedLog.searchTraces?.length ? '未使用/失败' : '未搜索') }}
+                </span>
+                <span v-if="selectedLog.responseTime !== undefined" class="diagnostic-chip">
+                  总耗时：{{ selectedLog.responseTime }}ms
+                </span>
+              </div>
+
+              <div v-if="selectedLog.timings && Object.keys(selectedLog.timings).length" class="diagnostic-timings">
+                <div v-for="(value, key) in selectedLog.timings" :key="key" class="diagnostic-timing">
+                  <span>{{ timingLabel(String(key)) }}</span>
+                  <strong>{{ value }}ms</strong>
+                </div>
+              </div>
+
+              <div v-if="selectedLog.sameCheck" class="diagnostic-block">
+                <div class="diagnostic-block-title">题目判重（内部）</div>
+                <div class="diagnostic-block-body">
+                  耗时 {{ selectedLog.sameCheck.durationMs ?? 0 }}ms
+                  <span v-if="selectedLog.sameCheck.error" class="search-trace-error"> · {{ selectedLog.sameCheck.error }}</span>
+                </div>
+              </div>
+
+              <div class="diagnostic-block">
+                <div class="diagnostic-block-title">事件时间线</div>
+                <div v-if="selectedLog.diagnosticTimeline?.length" class="diagnostic-timeline">
+                  <div v-for="(event, index) in selectedLog.diagnosticTimeline" :key="index" class="diagnostic-event">
+                    <span class="diagnostic-event-time">{{ formatTime(event.ts) }}</span>
+                    <span class="diagnostic-event-name">{{ event.event }}</span>
+                    <span class="diagnostic-event-data">{{ formatDiagnosticData(event.data) }}</span>
+                  </div>
+                </div>
+                <div v-else class="no-data"><span class="no-data-text">暂无诊断事件</span></div>
+              </div>
+
+              <div class="diagnostic-actions">
+                <button type="button" class="retry-btn-sm" @click="openLogDirFromHome">打开日志目录</button>
+              </div>
+            </div>
+            <div v-else class="no-data"><span class="no-data-text">请选择一条请求</span></div>
           </div>
 
           <!-- 模型响应部分 -->
@@ -608,6 +662,7 @@ import {
   formatSearchContextForModel,
   type SearchTrace
 } from '../services/searchService'
+import { logDiagnostic } from '../services/diagnosticLogger'
 
 
 
@@ -672,6 +727,34 @@ interface MultiModelResponse {
   reasoningContent?: string
   streamingReasoning?: string
   isLoading: boolean
+  kind?: 'model' | 'same_check' | 'summary'
+}
+
+type RequestPhase =
+  | 'received'
+  | 'matching'
+  | 'same_check'
+  | 'searching'
+  | 'answering'
+  | 'reporting'
+  | 'completed'
+  | 'error'
+  | 'timeout'
+
+interface RequestDiagnosticEvent {
+  ts: number
+  event: string
+  data?: Record<string, unknown>
+}
+
+interface RequestTimings {
+  dbMs?: number
+  sameCheckMs?: number
+  searchMs?: number
+  modelFirstTokenMs?: number
+  modelTotalMs?: number
+  reportMs?: number
+  hiddenMs?: number
 }
 
 interface RequestLog {
@@ -698,6 +781,16 @@ interface RequestLog {
   }
   multiModelResponses?: MultiModelResponse[] // 多模型并发响应
   searchTraces?: SearchTrace[] // 本次请求的联网搜索记录
+  searchUsed?: boolean // 本次最终答案是否实际使用了搜索上下文
+  phase?: RequestPhase
+  sameCheck?: {
+    startedAt: number
+    durationMs?: number
+    result?: string
+    error?: string
+  }
+  timings?: RequestTimings
+  diagnosticTimeline?: RequestDiagnosticEvent[]
   urlQuestion?: { // URL 题目数据（视觉分析）
     title: string
     options: string
@@ -718,6 +811,7 @@ const requestLogs = ref<RequestLog[]>([])
 const selectedLog = ref<RequestLog | null>(null)
 const showLogDetails = ref(false)
 const slideInActive = ref(false)
+let pageHiddenAt: number | null = null
 
 // 标签页相关状态
 const activeTab = ref('basic')
@@ -1020,6 +1114,12 @@ const withModelRetry = async <T>(
       lastError = error
       if (shouldSkipModelRetry(error, requestId) || attempt >= maxAttempts) throw error
       console.warn(`[模型重试 ${attempt}/${maxAttempts}] ${label}:`, formatModelCallError(error))
+      recordDiagnostic(requestId, 'model_retry', {
+        label,
+        attempt,
+        max_attempts: maxAttempts,
+        error: formatModelCallError(error)
+      })
       onRetry?.(attempt, maxAttempts, error)
       await new Promise((resolve) => setTimeout(resolve, Math.min(2000, 400 * attempt)))
     }
@@ -1228,6 +1328,41 @@ const addRequestLog = (log: Omit<RequestLog, 'id'>) => {
   trimRequestLogs()
 }
 
+const recordDiagnostic = (
+  requestId: string,
+  event: string,
+  data: Record<string, unknown> = {}
+) => {
+  if (!requestId) return
+  const log = requestLogs.value.find(item => item.id === requestId)
+  if (log) {
+    if (!log.diagnosticTimeline) log.diagnosticTimeline = []
+    log.diagnosticTimeline.push({ ts: Date.now(), event, data })
+  }
+  if (settings.diagnosticLogging !== false) {
+    logDiagnostic({
+      scope: 'request',
+      event,
+      requestId,
+      data
+    })
+  }
+}
+
+const setRequestPhase = (requestId: string, phase: RequestPhase) => {
+  const log = requestLogs.value.find(item => item.id === requestId)
+  if (!log) return
+  log.phase = phase
+  recordDiagnostic(requestId, 'phase_changed', { phase })
+}
+
+const addTiming = (requestId: string, key: keyof RequestTimings, value: number) => {
+  const log = requestLogs.value.find(item => item.id === requestId)
+  if (!log) return
+  if (!log.timings) log.timings = {}
+  log.timings[key] = Math.max(log.timings[key] || 0, Math.round(value))
+}
+
 // 启动SSE连接
 const startSSEConnection = () => {
   if (!serverRunning.value || !serverUrl.value) {
@@ -1277,8 +1412,16 @@ const startSSEConnection = () => {
           }
 
           console.log('创建的请求开始日志:', newLog)
+          newLog.phase = 'received'
+          newLog.timings = {}
+          newLog.diagnosticTimeline = []
           requestLogs.value.unshift(newLog)
           injectUrlQuestionIfNeeded(newLog)
+          recordDiagnostic(newLog.id, 'request_received', {
+            method: newLog.method,
+            path: newLog.path,
+            request_body_chars: String(newLog.requestBody || '').length
+          })
 
         } else if (logData.stage === 'completed') {
           // 请求完成阶段，更新现有记录
@@ -1292,7 +1435,12 @@ const startSSEConnection = () => {
             existingLog.responseTime = logData.response_time
             existingLog.responseBody = logData.response_body || ''
             existingLog.stage = 'completed'
+            existingLog.phase = 'completed'
             console.log('更新的请求完成日志:', existingLog)
+            recordDiagnostic(existingLog.id, 'backend_completed', {
+              status: logData.status,
+              response_time_ms: logData.response_time
+            })
           } else {
             // 如果没有找到开始记录，创建一个完整的记录
             const newLog: RequestLog = {
@@ -1356,8 +1504,16 @@ const startSSEConnection = () => {
             }
 
             console.log('创建的请求开始日志:', newLog)
+            newLog.phase = 'received'
+            newLog.timings = {}
+            newLog.diagnosticTimeline = []
             requestLogs.value.unshift(newLog)
             injectUrlQuestionIfNeeded(newLog)
+            recordDiagnostic(newLog.id, 'request_received', {
+              method: newLog.method,
+              path: newLog.path,
+              request_body_chars: String(newLog.requestBody || '').length
+            })
 
           } else if (logData.stage === 'completed') {
             // 请求完成阶段，更新现有记录
@@ -1371,7 +1527,12 @@ const startSSEConnection = () => {
               existingLog.responseTime = logData.response_time
               existingLog.responseBody = logData.response_body || ''
               existingLog.stage = 'completed'
+              existingLog.phase = 'completed'
               console.log('更新的请求完成日志:', existingLog)
+              recordDiagnostic(existingLog.id, 'backend_completed', {
+                status: logData.status,
+                response_time_ms: logData.response_time
+              })
 
               // 检查是否是URL检测响应，如果是则显示URL处理弹窗
               checkAndShowUrlDialog(existingLog)
@@ -1711,6 +1872,38 @@ const openSearchResultUrl = async (url: string) => {
     await openUrl(url)
   } catch {
     window.open(url, '_blank', 'noopener,noreferrer')
+  }
+}
+
+const openLogDirFromHome = async () => {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('open_log_dir')
+  } catch (error) {
+    console.error('打开日志目录失败:', error)
+  }
+}
+
+const timingLabel = (key: string): string => {
+  const labels: Record<string, string> = {
+    dbMs: '题库匹配',
+    sameCheckMs: '同题判重',
+    searchMs: '联网搜索',
+    modelFirstTokenMs: '首个 token',
+    modelTotalMs: '模型生成',
+    reportMs: '结果上报',
+    hiddenMs: '后台等待'
+  }
+  return labels[key] || key
+}
+
+const formatDiagnosticData = (data?: Record<string, unknown>): string => {
+  if (!data) return ''
+  try {
+    const text = JSON.stringify(data)
+    return text.length > 280 ? `${text.slice(0, 280)}…` : text
+  } catch {
+    return ''
   }
 }
 
@@ -2143,6 +2336,24 @@ const callModelWithStreaming = async (
     } else {
       chatMessages.push({ role: 'user', content: searchContext })
     }
+
+    const searchInjected = chatMessages.some(message =>
+      String(message.content || '').includes('【联网搜索结果】')
+    )
+    const log = requestLogs.value.find(item => item.id === requestId)
+    const trace = log?.searchTraces?.slice(-1)[0]
+    if (trace) {
+      trace.contextChars = Math.max(trace.contextChars || 0, searchContext.length)
+      if (searchInjected) {
+        trace.injected = true
+        if (!trace.injectedTo.includes('text')) trace.injectedTo.push('text')
+      }
+    }
+    recordDiagnostic(requestId, 'search_injected', {
+      target: 'text',
+      injected: searchInjected,
+      context_chars: searchContext.length
+    })
   }
   const testInput: any = {
     messages: chatMessages,
@@ -2163,17 +2374,33 @@ const callModelWithStreaming = async (
   // 读取超时配置（秒转毫秒）
   const { settings: appSettings } = useSettings()
   const timeoutMs = (appSettings.modelResponseTimeout ?? 40) * 1000
+  const absoluteTimeoutMs = Math.max(
+    timeoutMs,
+    (appSettings.modelAbsoluteTimeout ?? 300) * 1000
+  )
 
-  // AbortController 用于超时中断 fetch
+  // AbortController：无新内容超时 + 单题绝对上限
   const abortController = new AbortController()
   registerAbortController(requestId, abortController)
-  const timeoutHandle = setTimeout(() => {
+
+  let inactivityHandle: ReturnType<typeof setTimeout> | null = null
+  const abortWithMessage = (message: string) => {
     if (!isRequestCancelled(requestId)) {
-      abortController.abort(new DOMException(`模型响应超时（${Math.round(timeoutMs / 1000)} 秒）`, 'TimeoutError'))
+      abortController.abort(new DOMException(message, 'TimeoutError'))
     } else {
       abortController.abort()
     }
-  }, timeoutMs)
+  }
+  const armInactivityTimeout = () => {
+    if (inactivityHandle) clearTimeout(inactivityHandle)
+    inactivityHandle = setTimeout(() => {
+      abortWithMessage(`模型无新内容超时（${Math.round(timeoutMs / 1000)} 秒）`)
+    }, timeoutMs)
+  }
+  armInactivityTimeout()
+  const absoluteHandle = setTimeout(() => {
+    abortWithMessage(`模型响应超过单题上限（${Math.round(absoluteTimeoutMs / 1000)} 秒）`)
+  }, absoluteTimeoutMs)
 
   const tauriHttp = await import('@tauri-apps/plugin-http')
   const { invoke } = await import('@tauri-apps/api/core')
@@ -2224,6 +2451,7 @@ const callModelWithStreaming = async (
         sendModelProgressToBackend(requestId, fullResponse || 'keepalive')
       }, 2000)
 
+      let firstTokenAt = 0
       while (true) {
         // 执行模型调用
         const result = await processModel(testInput, config, tauriFetch, abortController.signal)
@@ -2235,6 +2463,7 @@ const callModelWithStreaming = async (
 
             for await (const chunk of result) {
               if (chunk.tool_calls) {
+                armInactivityTimeout()
                 for (const tc of chunk.tool_calls) {
                   const existing = toolCalls.find(t => t.id === tc.id)
                   if (existing) {
@@ -2245,7 +2474,17 @@ const callModelWithStreaming = async (
                 }
               }
               if (chunk.content) {
+                armInactivityTimeout()
                 fullResponse += chunk.content
+                if (!firstTokenAt) {
+                  firstTokenAt = Date.now()
+                  const firstLog = requestLogs.value.find(item => item.id === requestId)
+                  addTiming(requestId, 'modelFirstTokenMs', firstTokenAt - (firstLog?.timestamp || firstTokenAt))
+                  recordDiagnostic(requestId, 'model_first_token', {
+                    model: model.displayName,
+                    from_request_ms: firstTokenAt - (firstLog?.timestamp || firstTokenAt)
+                  })
+                }
                 // 实时更新UI显示
                 if (onChunk) {
                   onChunk(fullResponse)
@@ -2260,7 +2499,17 @@ const callModelWithStreaming = async (
               }
               const rc = getReasoningContentValue(chunk)
               if (rc) {
+                armInactivityTimeout()
                 fullReasoning += rc
+                if (!firstTokenAt) {
+                  firstTokenAt = Date.now()
+                  const firstLog = requestLogs.value.find(item => item.id === requestId)
+                  addTiming(requestId, 'modelFirstTokenMs', firstTokenAt - (firstLog?.timestamp || firstTokenAt))
+                  recordDiagnostic(requestId, 'model_first_token', {
+                    model: model.displayName,
+                    from_request_ms: firstTokenAt - (firstLog?.timestamp || firstTokenAt)
+                  })
+                }
                 if (onReasoning) {
                   onReasoning(fullReasoning)
                 } else {
@@ -2341,16 +2590,18 @@ const callModelWithStreaming = async (
         throw createCancelledRequestError()
       }
       if (isAbortLikeError(error)) {
-        throw new Error(`模型响应超时（${Math.round(timeoutMs / 1000)} 秒）或连接被中断`)
+        throw new Error(formatModelCallError(error, '模型响应超时或连接被中断'))
       }
       throw new Error(formatModelCallError(error))
     } finally {
-      clearTimeout(timeoutHandle)
+      if (inactivityHandle) clearTimeout(inactivityHandle)
+      clearTimeout(absoluteHandle)
       if (keepaliveTimer !== null) clearInterval(keepaliveTimer)
       unregisterAbortController(requestId, abortController)
     }
   } else {
-    clearTimeout(timeoutHandle)
+    if (inactivityHandle) clearTimeout(inactivityHandle)
+    clearTimeout(absoluteHandle)
     unregisterAbortController(requestId, abortController)
     throw new Error('模型未配置可执行代码')
   }
@@ -2510,7 +2761,36 @@ const applyRequestLogCompletePayload = (payload: {
 }
 
 const onVisibilityChange = () => {
+  if (document.visibilityState === 'hidden') {
+    if (pageHiddenAt === null) pageHiddenAt = Date.now()
+    for (const log of requestLogs.value) {
+      if (!log.status && log.phase !== 'completed') {
+        recordDiagnostic(log.id, 'visibility_hidden', {
+          phase: log.phase,
+          elapsed_ms: Date.now() - log.timestamp
+        })
+      }
+    }
+    return
+  }
+
   if (document.visibilityState !== 'visible') return
+
+  if (pageHiddenAt !== null) {
+    const hiddenMs = Date.now() - pageHiddenAt
+    for (const log of requestLogs.value) {
+      if (!log.status && log.phase !== 'completed') {
+        if (!log.timings) log.timings = {}
+        log.timings.hiddenMs = (log.timings.hiddenMs || 0) + hiddenMs
+        recordDiagnostic(log.id, 'visibility_visible', {
+          hidden_ms: hiddenMs,
+          phase: log.phase
+        })
+      }
+    }
+    pageHiddenAt = null
+  }
+
   // 回到前台：补发心跳 + 必要时重连 SSE，避免后台掉线后无法继续处理
   if (serverRunning.value) {
     if (!sseEventSource || sseEventSource.readyState === EventSource.CLOSED) {
@@ -2755,7 +3035,10 @@ const runSearchForRequest = async (
     toolName: config.toolName,
     status: 'searching',
     startedAt: Date.now(),
-    results: []
+    results: [],
+    injected: false,
+    injectedTo: [],
+    contextChars: 0
   })
 
   if (log) {
@@ -2765,6 +3048,12 @@ const runSearchForRequest = async (
 
   const abortController = new AbortController()
   registerAbortController(requestId, abortController)
+  setRequestPhase(requestId, 'searching')
+  recordDiagnostic(requestId, 'search_start', {
+    mode: config.mode,
+    tool: config.toolName,
+    query_chars: searchQuery.length
+  })
   startSearchHeartbeat(requestId)
   void sendModelProgressToBackend(requestId, 'searching')
 
@@ -2776,11 +3065,25 @@ const runSearchForRequest = async (
     trace.rawText = outcome.rawText
     trace.mode = outcome.mode
     trace.toolName = outcome.toolName
+    addTiming(requestId, 'searchMs', outcome.durationMs)
+    recordDiagnostic(requestId, 'search_end', {
+      status: 'success',
+      results: outcome.results.length,
+      duration_ms: outcome.durationMs,
+      mode: outcome.mode,
+      tool: outcome.toolName
+    })
     return { context: formatSearchContextForModel(outcome), trace }
   } catch (error) {
     trace.status = 'error'
     trace.durationMs = Date.now() - trace.startedAt
     trace.error = formatModelCallError(error, '联网搜索失败')
+    addTiming(requestId, 'searchMs', trace.durationMs)
+    recordDiagnostic(requestId, 'search_end', {
+      status: 'error',
+      duration_ms: trace.durationMs,
+      error: trace.error
+    })
     if (abortController.signal.aborted || isRequestCancelled(requestId)) {
       throw createCancelledRequestError()
     }
@@ -2793,11 +3096,81 @@ const runSearchForRequest = async (
   }
 }
 
+/**
+ * 最终答案发送前的搜索门禁。
+ * - 搜索未完成：不允许发送最终答案
+ * - 搜索失败/未注入：failOpen=true 时继续，但标记 searchUsed=false
+ */
+const finalizeSearchUsage = (
+  requestId: string
+): { ok: boolean; reason?: string } => {
+  const config = settings.search
+  const log = requestLogs.value.find(item => item.id === requestId)
+  if (!config?.enabled) {
+    if (log) log.searchUsed = false
+    return { ok: true }
+  }
+
+  const trace = log?.searchTraces?.[(log.searchTraces?.length || 0) - 1]
+  if (!trace) {
+    const reason = '联网搜索未执行'
+    recordDiagnostic(requestId, 'search_gate_failed', { reason })
+    if (log) log.searchUsed = false
+    return { ok: config.failOpen !== false, reason }
+  }
+
+  if (trace.status === 'searching') {
+    const reason = '联网搜索尚未完成'
+    recordDiagnostic(requestId, 'search_gate_failed', { reason })
+    if (log) log.searchUsed = false
+    return { ok: false, reason }
+  }
+
+  if (trace.status === 'error') {
+    const reason = `联网搜索失败：${trace.error || '未知错误'}`
+    recordDiagnostic(requestId, 'search_gate_failed', { reason })
+    if (log) log.searchUsed = false
+    return { ok: config.failOpen !== false, reason }
+  }
+
+  if (!trace.injected) {
+    const reason = '搜索结果未注入模型 prompt'
+    recordDiagnostic(requestId, 'search_injection_missing', {
+      reason,
+      results: trace.results.length
+    })
+    if (log) log.searchUsed = false
+    return { ok: config.failOpen !== false, reason }
+  }
+
+  if (log) log.searchUsed = true
+  recordDiagnostic(requestId, 'search_gate_passed', {
+    results: trace.results.length,
+    injected_to: trace.injectedTo,
+    context_chars: trace.contextChars
+  })
+  return { ok: true }
+}
+
 const callModelAPI = async (requestId: string, query: string) => {
   let finalOutput = ''
   console.log('开始调用模型API:', { requestId, query })
+  const existingLog = requestLogs.value.find(item => item.id === requestId)
+  if (existingLog?.status) {
+    console.warn('请求已完成，忽略重复的最终答题事件:', requestId)
+    return
+  }
+
   // 允许同一 requestId 在同题判断后再次发送最终答题结果
   finalModelResponseState.delete(requestId)
+  if (existingLog) {
+    existingLog.phase = 'answering'
+    existingLog.timings = existingLog.timings || {}
+    recordDiagnostic(requestId, 'final_answer_start', {
+      query_chars: query.length,
+      same_check_ms: existingLog.timings.sameCheckMs
+    })
+  }
   void sendModelProgressToBackend(requestId, 'dispatch')
 
   try {
@@ -2814,7 +3187,9 @@ const callModelAPI = async (requestId: string, query: string) => {
       if (logIndex !== -1) {
         requestLogs.value[logIndex].modelResponse = errorText
         requestLogs.value[logIndex].isModelCalling = false
+        requestLogs.value[logIndex].phase = 'error'
       }
+      recordDiagnostic(requestId, 'no_model_selected')
       await sendModelResponseToBackend(requestId, errorText, false)
       return
     }
@@ -2851,7 +3226,31 @@ const callModelAPI = async (requestId: string, query: string) => {
       selectedModels.length > 1 ? '联网搜索（多模型共用）' : (selectedModels[0]?.displayName || '联网搜索')
     )
     const searchContext = searchResult?.context || ''
+    const searchTrace = requestLogs.value
+      .find(item => item.id === requestId)
+      ?.searchTraces?.slice(-1)[0]
     if (isRequestCancelled(requestId)) return
+
+    if (settings.search?.enabled && !searchContext && settings.search?.failOpen === false) {
+      const reason = searchTrace?.error || '联网搜索未返回结果'
+      const errorText = `错误: ${reason}`
+      const failedLog = requestLogs.value.find(item => item.id === requestId)
+      if (failedLog) {
+        failedLog.modelResponse = errorText
+        failedLog.isModelCalling = false
+        failedLog.phase = 'error'
+      }
+      recordDiagnostic(requestId, 'search_required_failed', { reason })
+      await sendModelResponseToBackend(requestId, errorText, false)
+      return
+    }
+
+    setRequestPhase(requestId, 'answering')
+    recordDiagnostic(requestId, 'search_context_ready', {
+      has_context: !!searchContext,
+      context_chars: searchContext.length,
+      results: searchTrace?.results.length || 0
+    })
 
     // 启动心跳（缩短间隔，减轻后台 setInterval 节流影响）
     if (serverRunning.value && serverUrl.value && !heartbeatIntervals.has(requestId)) {
@@ -2873,6 +3272,11 @@ const callModelAPI = async (requestId: string, query: string) => {
     // 并发调用基础模型
     // 重试条件：仅有一个基础模型，或当前是视觉模型
     const visionModelId = globalSelectedVisionModel.value?.id
+    const modelPhaseStartedAt = Date.now()
+    recordDiagnostic(requestId, 'model_dispatch', {
+      models: selectedModels.map(model => model.displayName),
+      search_injected: !!searchContext
+    })
     const results: { model: AIModel; response: string; success: boolean }[] = []
     const modelPromises = selectedModels.map(async (model) => {
       const allowRetry = selectedModels.length === 1 || (!!visionModelId && model.id === visionModelId)
@@ -2947,6 +3351,12 @@ const callModelAPI = async (requestId: string, query: string) => {
         results.push(settled.value)
       }
     }
+    addTiming(requestId, 'modelTotalMs', Date.now() - modelPhaseStartedAt)
+    recordDiagnostic(requestId, 'model_end', {
+      success: results.filter(result => result.success).length,
+      failed: results.filter(result => !result.success).length,
+      duration_ms: Date.now() - modelPhaseStartedAt
+    })
 
     if (isRequestCancelled(requestId)) return
 
@@ -2962,6 +3372,22 @@ const callModelAPI = async (requestId: string, query: string) => {
       ? successfulResults[0]
       : successfulModels.map((model, i) => `[${model.displayName}]\n${successfulResults[i]}`).join('\n\n')
     const majorityBaseAnswer = getMostFrequentSuccessfulAnswer(successfulResults)
+
+    // 最终答案门禁：搜索未结束/未注入时，按 failOpen 决定继续还是报错
+    const searchGate = finalizeSearchUsage(requestId)
+    if (!searchGate.ok) {
+      const reason = searchGate.reason || '联网搜索未完成'
+      const errorText = `错误: ${reason}`
+      const gateLog = requestLogs.value.find(item => item.id === requestId)
+      if (gateLog) {
+        gateLog.modelResponse = errorText
+        gateLog.isModelCalling = false
+        gateLog.phase = 'error'
+      }
+      recordDiagnostic(requestId, 'final_answer_blocked', { reason })
+      await sendModelResponseToBackend(requestId, errorText, false)
+      return
+    }
 
     if (summaryModels.length > 0 && successfulResults.length > 0) {
       console.log('开始总结阶段:', summaryModels.map(m => m.displayName))
@@ -3001,6 +3427,26 @@ ${searchContext ? `\n联网搜索结果：\n${searchContext}\n` : ''}
 ${baseCombinedResponse}
 
 请直接给出最终总结答案：`
+
+      if (searchContext) {
+        const summaryLog = requestLogs.value.find(item => item.id === requestId)
+        const summaryTrace = summaryLog?.searchTraces?.slice(-1)[0]
+        const summaryInjected = summaryQuery.includes('【联网搜索结果】')
+        if (summaryTrace) {
+          summaryTrace.contextChars = Math.max(summaryTrace.contextChars || 0, searchContext.length)
+          if (summaryInjected) {
+            summaryTrace.injected = true
+            if (!summaryTrace.injectedTo.includes('summary')) {
+              summaryTrace.injectedTo.push('summary')
+            }
+          }
+        }
+        recordDiagnostic(requestId, 'search_injected', {
+          target: 'summary',
+          injected: summaryInjected,
+          context_chars: searchContext.length
+        })
+      }
 
       const summaryResults = await Promise.all(
         summaryModels.map(async (model) => {
@@ -3215,6 +3661,10 @@ const applyLocalRequestCompletion = (
 ) => {
   const log = requestLogs.value.find(l => l.id === requestId)
   if (!log) return
+  if (pageHiddenAt !== null) {
+    if (!log.timings) log.timings = {}
+    log.timings.hiddenMs = (log.timings.hiddenMs || 0) + (Date.now() - pageHiddenAt)
+  }
   // 仅在仍为「处理中」时本地收口；SSE/Tauri 权威状态可覆盖
   if (!log.status) {
     log.status = status
@@ -3223,6 +3673,7 @@ const applyLocalRequestCompletion = (
   } else if (log.status !== status) {
     log.status = status
   }
+  log.phase = status >= 200 && status < 300 ? 'completed' : 'error'
   if (responseBody && !log.responseBody) {
     log.responseBody = responseBody
   }
@@ -3232,21 +3683,32 @@ const applyLocalRequestCompletion = (
 const isTimeoutLikeModelFailureText = (text: string) =>
   /timeout|超时|no new tokens|aborted|abort|cancelled|canceled|取消|服务已停止/i.test(text)
 
-const sendModelResponseToBackend = async (requestId: string, content: string, isSuccess: boolean = true, reasoningContent = '') => {
-  const existingState = finalModelResponseState.get(requestId)
-  if (existingState === 'success') {
-    console.warn('忽略重复的模型最终响应（已成功发送）:', { requestId, isSuccess })
-    return
-  }
-  if (existingState === 'error' && !isSuccess) {
-    console.warn('忽略重复的模型错误响应:', { requestId })
-    return
+const sendModelResponseToBackend = async (
+  requestId: string,
+  content: string,
+  isSuccess: boolean = true,
+  reasoningContent = '',
+  options: { phase?: 'intermediate' | 'final' } = {}
+) => {
+  const phase = options.phase || 'final'
+
+  // 中间响应（同题判重）不能参与最终状态收口
+  if (phase === 'final') {
+    const existingState = finalModelResponseState.get(requestId)
+    if (existingState === 'success') {
+      console.warn('忽略重复的模型最终响应（已成功发送）:', { requestId, isSuccess })
+      return
+    }
+    if (existingState === 'error' && !isSuccess) {
+      console.warn('忽略重复的模型错误响应:', { requestId })
+      return
+    }
   }
 
   // 去掉 A./B. 前缀，纯字母映射为选项正文，避免 OCS 收到带序号的答案
-  const options = getRequestOptionsFromLog(requestId)
-  const normalizedContent = isSuccess
-    ? normalizeAnswerJsonContent(content, options)
+  const requestOptions = getRequestOptionsFromLog(requestId)
+  const normalizedContent = isSuccess && phase === 'final'
+    ? normalizeAnswerJsonContent(content, requestOptions)
     : content
 
   // 先停心跳，避免错误宽限期内仍被 keepalive 拖住观感
@@ -3271,23 +3733,41 @@ const sendModelResponseToBackend = async (requestId: string, content: string, is
       throw new Error(`HTTP error! status: ${response.status}`)
     }
 
-    finalModelResponseState.set(requestId, isSuccess ? 'success' : 'error')
-    if (isSuccess && normalizedContent !== content) {
-      const log = requestLogs.value.find(l => l.id === requestId)
-      if (log) log.modelResponse = normalizedContent
+    if (phase === 'final') {
+      finalModelResponseState.set(requestId, isSuccess ? 'success' : 'error')
+      if (isSuccess && normalizedContent !== content) {
+        const log = requestLogs.value.find(l => l.id === requestId)
+        if (log) log.modelResponse = normalizedContent
+      }
+
+      // 请求端可能已断开导致后端来不及推 completed；本地先收口状态，避免一直「处理中」
+      const provisionalStatus = isSuccess
+        ? 200
+        : (isTimeoutLikeModelFailureText(normalizedContent) ? 408 : 500)
+      applyLocalRequestCompletion(
+        requestId,
+        provisionalStatus,
+        JSON.stringify({ code: isSuccess ? 1 : 0, message: normalizedContent })
+      )
+      recordDiagnostic(requestId, 'final_response_sent', {
+        success: isSuccess,
+        status: provisionalStatus,
+        content_chars: normalizedContent.length,
+        reasoning_chars: reasoningContent.length
+      })
+    } else {
+      recordDiagnostic(requestId, 'intermediate_response_sent', {
+        success: isSuccess,
+        content_chars: normalizedContent.length
+      })
     }
 
-    // 请求端可能已断开导致后端来不及推 completed；本地先收口状态，避免一直「处理中」
-    const provisionalStatus = isSuccess
-      ? 200
-      : (isTimeoutLikeModelFailureText(normalizedContent) ? 408 : 500)
-    applyLocalRequestCompletion(
+    console.log(`模型${phase === 'final' ? '最终' : '中间'}响应已发送到后端:`, {
       requestId,
-      provisionalStatus,
-      JSON.stringify({ code: isSuccess ? 1 : 0, message: normalizedContent })
-    )
-
-    console.log('模型响应已发送到后端:', { requestId, content: normalizedContent, reasoningContent, isSuccess })
+      content: normalizedContent,
+      reasoningContent,
+      isSuccess
+    })
 
     // 只有在成功调用模型时才存储AI响应到数据库
     if (isSuccess) {
@@ -3301,12 +3781,19 @@ const sendModelResponseToBackend = async (requestId: string, content: string, is
 
   } catch (error) {
     console.error('发送模型响应到后端失败:', error)
-    // 即便上报失败，UI 也不应一直停在处理中
-    applyLocalRequestCompletion(
-      requestId,
-      isSuccess ? 200 : (isTimeoutLikeModelFailureText(normalizedContent) ? 408 : 500),
-      normalizedContent
-    )
+    recordDiagnostic(requestId, 'model_response_post_failed', {
+      phase,
+      success: isSuccess,
+      error: formatModelCallError(error, '发送模型响应失败')
+    })
+    // 即便上报失败，UI 也不应一直停在处理中；中间响应失败不碰最终状态
+    if (phase === 'final') {
+      applyLocalRequestCompletion(
+        requestId,
+        isSuccess ? 200 : (isTimeoutLikeModelFailureText(normalizedContent) ? 408 : 500),
+        normalizedContent
+      )
+    }
   }
 }
 
@@ -3566,21 +4053,48 @@ const parseSameQuestionCheckResult = (raw: string): { same: boolean; matched_id?
 
 // 处理 AI 同题判断请求（单模型）
 const handleSameQuestionCheckRequest = async (requestId: string, payloadJson: string) => {
-  finalModelResponseState.delete(requestId)
-
   let payload: SameQuestionCheckPayload
+  const sameCheckStartedAt = Date.now()
+  const setSameCheckResult = (result: string, error = '') => {
+    const log = requestLogs.value.find(l => l.id === requestId)
+    if (!log) return
+    log.sameCheck = {
+      startedAt: sameCheckStartedAt,
+      durationMs: Date.now() - sameCheckStartedAt,
+      result,
+      ...(error ? { error } : {})
+    }
+    addTiming(requestId, 'sameCheckMs', Date.now() - sameCheckStartedAt)
+    recordDiagnostic(requestId, 'same_check_end', {
+      result,
+      duration_ms: Date.now() - sameCheckStartedAt,
+      error: error || undefined
+    })
+  }
+
+  setRequestPhase(requestId, 'same_check')
+  recordDiagnostic(requestId, 'same_check_start', {
+    title_chars: String(payloadJson || '').length
+  })
+
   try {
     payload = JSON.parse(payloadJson)
   } catch (error) {
     console.error('解析同题判断 payload 失败:', error)
-    await sendModelResponseToBackend(requestId, JSON.stringify({ same: false }), true)
+    setSameCheckResult(JSON.stringify({ same: false }), 'payload_parse_failed')
+    await sendModelResponseToBackend(requestId, JSON.stringify({ same: false }), true, '', {
+      phase: 'intermediate'
+    })
     return
   }
 
   const model = globalSelectedTextModels.value[0] || globalSelectedTextModel.value
   if (!model) {
     console.warn('同题判断：未选择文本模型，回落为不同题')
-    await sendModelResponseToBackend(requestId, JSON.stringify({ same: false }), true)
+    setSameCheckResult(JSON.stringify({ same: false }), 'no_text_model')
+    await sendModelResponseToBackend(requestId, JSON.stringify({ same: false }), true, '', {
+      phase: 'intermediate'
+    })
     return
   }
 
@@ -3591,12 +4105,13 @@ const handleSameQuestionCheckRequest = async (requestId: string, payloadJson: st
     requestLogs.value[logIndex].modelResponse = undefined
     requestLogs.value[logIndex].multiModelResponses = [{
       modelId: model.id,
-      modelName: model.displayName,
+      modelName: `判重: ${model.displayName}`,
       platformName: platform?.displayName || '未知平台',
       response: '',
       streamingReasoning: '',
       reasoningContent: '',
-      isLoading: true
+      isLoading: true,
+      kind: 'same_check'
     }]
   }
 
@@ -3637,8 +4152,12 @@ const handleSameQuestionCheckRequest = async (requestId: string, payloadJson: st
       log.isModelCalling = false
       log.modelResponse = resultJson
     }
+    setSameCheckResult(resultJson)
 
-    await sendModelResponseToBackend(requestId, resultJson, true)
+    // 判重只是内部中间步骤：只解锁后端等待，不写最终状态/响应时间
+    await sendModelResponseToBackend(requestId, resultJson, true, '', {
+      phase: 'intermediate'
+    })
   } catch (error) {
     console.error('同题判断失败:', error)
     const fallback = JSON.stringify({ same: false })
@@ -3651,7 +4170,10 @@ const handleSameQuestionCheckRequest = async (requestId: string, payloadJson: st
         log.multiModelResponses[0].response = fallback
       }
     }
-    await sendModelResponseToBackend(requestId, fallback, true)
+    setSameCheckResult(fallback, formatModelCallError(error, '同题判断失败'))
+    await sendModelResponseToBackend(requestId, fallback, true, '', {
+      phase: 'intermediate'
+    })
   }
 }
 
@@ -4351,6 +4873,19 @@ const analyzeUrlQuestion = async (requestId: string) => {
     const searchContext = visionSearch?.context || ''
     if (isRequestCancelled(requestId)) return
 
+    if (settings.search?.enabled && !searchContext && settings.search?.failOpen === false) {
+      const reason = log.searchTraces?.slice(-1)[0]?.error || '联网搜索未返回结果'
+      const errorText = `错误: ${reason}`
+      log.urlQuestion.analysisError = errorText
+      log.urlQuestion.analyzing = false
+      log.modelResponse = errorText
+      log.isModelCalling = false
+      log.phase = 'error'
+      recordDiagnostic(requestId, 'search_required_failed', { reason, target: 'vision' })
+      await sendModelResponseToBackend(requestId, errorText, false)
+      return
+    }
+
     const mode = classifyUrlQuestionMode(questionType, options)
     const optionMap = buildUrlOptionMapForMode(mode, options)
     const { optionsText, answerRule, typeHint } = buildUrlQuestionPromptParts(
@@ -4370,6 +4905,27 @@ const analyzeUrlQuestion = async (requestId: string) => {
       ? [{ type: 'text', text: searchContext }, ...multimodalContent]
       : multimodalContent
     const preparedMultimodalContent = await prepareVisionRequestContent(multimodalContentWithSearch)
+
+    if (searchContext) {
+      const visionTrace = log.searchTraces?.slice(-1)[0]
+      const visionInjected = preparedMultimodalContent.some((item: any) =>
+        item && item.type === 'text' && String(item.text || '').includes('【联网搜索结果】')
+      )
+      if (visionTrace) {
+        visionTrace.contextChars = Math.max(visionTrace.contextChars || 0, searchContext.length)
+        if (visionInjected) {
+          visionTrace.injected = true
+          if (!visionTrace.injectedTo.includes('vision')) {
+            visionTrace.injectedTo.push('vision')
+          }
+        }
+      }
+      recordDiagnostic(requestId, 'search_injected', {
+        target: 'vision',
+        injected: visionInjected,
+        context_chars: searchContext.length
+      })
+    }
 
     const analysisInput = {
       messages: [{ role: 'user', content: preparedMultimodalContent }],
@@ -4480,6 +5036,19 @@ const analyzeUrlQuestion = async (requestId: string) => {
     if (l) l.isModelCalling = false
 
     if (isRequestCancelled(requestId)) return
+
+    const visionSearchGate = finalizeSearchUsage(requestId)
+    if (!visionSearchGate.ok) {
+      const reason = visionSearchGate.reason || '联网搜索未完成'
+      const errorText = `错误: ${reason}`
+      l.urlQuestion.analysisError = errorText
+      l.modelResponse = errorText
+      l.isModelCalling = false
+      l.phase = 'error'
+      recordDiagnostic(requestId, 'final_answer_blocked', { reason, target: 'vision' })
+      await sendModelResponseToBackend(requestId, errorText, false)
+      return
+    }
 
     if (answer) {
       await sendModelResponseToBackend(requestId, JSON.stringify({ answer }), true, fullReasoning)
@@ -6262,5 +6831,126 @@ a.search-result-title:hover {
   border: 1px solid var(--border-color, #e2e8f0);
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.search-injection-badge.ok {
+  color: #38a169 !important;
+  background: rgba(56, 161, 105, 0.12) !important;
+}
+
+.search-injection-badge.missing {
+  color: #e53e3e !important;
+  background: rgba(229, 62, 62, 0.12) !important;
+}
+
+.diagnostic-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.diagnostic-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.diagnostic-chip {
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--bg-tertiary, rgba(0, 0, 0, 0.05));
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.diagnostic-chip.ok {
+  color: #38a169;
+  background: rgba(56, 161, 105, 0.12);
+}
+
+.diagnostic-timings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.diagnostic-timing {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color, #e2e8f0);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.diagnostic-timing strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.diagnostic-block {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color, #e2e8f0);
+}
+
+.diagnostic-block-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+
+.diagnostic-block-body {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.diagnostic-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.diagnostic-event {
+  display: grid;
+  grid-template-columns: 64px 130px 1fr;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--border-color, #e2e8f0);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.diagnostic-event:last-child {
+  border-bottom: none;
+}
+
+.diagnostic-event-time {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.diagnostic-event-name {
+  color: var(--color-primary, #007acc);
+  font-weight: 500;
+  word-break: break-all;
+}
+
+.diagnostic-event-data {
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+.diagnostic-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 </style>

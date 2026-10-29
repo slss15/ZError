@@ -1,4 +1,5 @@
 use crate::app_activity::{begin_server_activity, end_server_activity};
+use crate::diagnostics;
 use crate::database::{
     get_ai_response_by_id, insert_ai_response, query_database_candidates, query_database_exact,
     set_question_pending_correction, QuestionMatch,
@@ -54,9 +55,31 @@ fn model_wait_budget_secs(has_url: bool) -> (u64, u64) {
         .and_then(|v| v.as_u64())
         .unwrap_or(2)
         .min(10);
+    let model_absolute = cfg
+        .get("modelAbsoluteTimeout")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(300)
+        .clamp(30, 1800);
+
+    let search = cfg.get("search");
+    let search_enabled = search
+        .and_then(|value| value.get("enabled"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let search_timeout = search
+        .and_then(|value| value.get("timeoutSeconds"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(30)
+        .clamp(5, 300);
+
     let inactivity = timeout.saturating_add(20).max(30);
-    let absolute = timeout
-        .saturating_mul(retries + 1)
+    // 同题判重最多 45s；搜索最多 search_timeout；再加上上报/网络缓冲
+    let same_check_budget = 45u64;
+    let search_budget = if search_enabled { search_timeout } else { 0 };
+    let absolute = model_absolute
+        .max(timeout.saturating_mul(retries + 1))
+        .saturating_add(same_check_budget)
+        .saturating_add(search_budget)
         .saturating_add(if has_url { 90 } else { 60 })
         .max(inactivity);
     (inactivity, absolute)
@@ -459,6 +482,17 @@ async fn wait_and_store_ai_answer(
         }
         Err(e) => {
             println!("❌ Model call timeout or error: {}", e);
+            let _ = diagnostics::append_event(
+                "error",
+                "server",
+                "model_wait_failed",
+                Some(request_id),
+                serde_json::json!({
+                    "error": e.to_string(),
+                    "inactivity_secs": inactivity_secs,
+                    "absolute_secs": absolute_secs
+                }),
+            );
             (
                 408,
                 QueryResponse::error(format!("Model call failed: {}", e)),
@@ -485,6 +519,13 @@ async fn resolve_query_with_same_question_check(
     match query_database_exact(&request.title, request.options.as_deref()).await {
         Ok(exact_hits) if !exact_hits.is_empty() => {
             println!("✅ 精确匹配命中: {} 条", exact_hits.len());
+            let _ = diagnostics::append_event(
+                "info",
+                "server",
+                "db_exact_hit",
+                Some(request_id),
+                serde_json::json!({ "count": exact_hits.len() }),
+            );
             let data_list: Vec<QueryData> = exact_hits
                 .into_iter()
                 .map(|m| {
@@ -538,6 +579,13 @@ async fn resolve_query_with_same_question_check(
         println!(
             "🤖 发现 {} 条近似候选，请求 AI 同题判断",
             candidates.len()
+        );
+        let _ = diagnostics::append_event(
+            "info",
+            "server",
+            "same_check_start",
+            Some(request_id),
+            serde_json::json!({ "candidates": candidates.len() }),
         );
         let check_prompt =
             build_same_question_check_prompt(&request.title, request.options.as_deref(), &candidates);
@@ -808,6 +856,17 @@ pub async fn start_server(
                     .await;
                     let response_time = start_time.elapsed().as_millis() as u64;
                     let response_body = serde_json::to_string(&result.1).unwrap_or_default();
+                    let _ = diagnostics::append_event(
+                        "info",
+                        "server",
+                        "query_complete",
+                        Some(&request_id_task),
+                        serde_json::json!({
+                            "method": "POST",
+                            "status": result.0,
+                            "response_time_ms": response_time
+                        }),
+                    );
                     if let Some(app) = app_task.as_ref() {
                         let _ = app.emit(
                             "request-log-complete",
@@ -921,6 +980,17 @@ pub async fn start_server(
                     .await;
                     let response_time = start_time.elapsed().as_millis() as u64;
                     let response_body = serde_json::to_string(&result.1).unwrap_or_default();
+                    let _ = diagnostics::append_event(
+                        "info",
+                        "server",
+                        "query_complete",
+                        Some(&request_id_task),
+                        serde_json::json!({
+                            "method": "GET",
+                            "status": result.0,
+                            "response_time_ms": response_time
+                        }),
+                    );
                     if let Some(app) = app_task.as_ref() {
                         let _ = app.emit(
                             "request-log-complete",

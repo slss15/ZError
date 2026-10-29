@@ -15,6 +15,19 @@
           <Toggle v-model="search.enabled" variant="default" size="medium" />
         </div>
       </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <h3 class="setting-title">搜索失败时继续作答</h3>
+          <p class="setting-description">
+            开启：搜索失败/超时后仍调用模型，但详情会标记“未使用搜索”。
+            关闭：搜索失败直接返回错误，不发送无搜索结果的答案。
+          </p>
+        </div>
+        <div class="setting-control">
+          <Toggle v-model="search.failOpen" variant="default" size="medium" />
+        </div>
+      </div>
     </div>
 
     <div class="network-group">
@@ -234,6 +247,30 @@
       </details>
     </div>
 
+    <div class="network-group">
+      <div class="group-title">诊断</div>
+      <div class="setting-item">
+        <div class="setting-info">
+          <h3 class="setting-title">记录诊断日志</h3>
+          <p class="setting-description">
+            写入 %LOCALAPPDATA%\ZError\logs\app-YYYYMMDD.jsonl，包含搜索、模型、后台等待等阶段耗时；不记录 API Key。
+          </p>
+        </div>
+        <div class="setting-control">
+          <Toggle v-model="diagnosticLogging" variant="default" size="medium" />
+        </div>
+      </div>
+      <div class="setting-item">
+        <div class="setting-info">
+          <h3 class="setting-title">日志目录</h3>
+          <p class="setting-description">排查“响应时间异常 / 搜索未注入”时，先打开这里查看最近的 JSONL。</p>
+        </div>
+        <div class="setting-control">
+          <button type="button" class="reset-btn" @click="openLogDir">打开日志目录</button>
+        </div>
+      </div>
+    </div>
+
     <div class="footer-actions">
       <button type="button" class="reset-btn" @click="restoreExaDefaults">恢复 Exa 默认配置</button>
     </div>
@@ -257,6 +294,7 @@ if (!settings.value.search) {
 }
 
 const search = toRef(settings.value, 'search') as Ref<SearchSettingsType>
+const diagnosticLogging = toRef(settings.value, 'diagnosticLogging') as Ref<boolean>
 
 const showApiKey = ref(false)
 const testQuery = ref('')
@@ -319,6 +357,15 @@ const openUrl = async (url: string) => {
     await openExternal(url)
   } catch {
     window.open(url, '_blank', 'noopener,noreferrer')
+  }
+}
+
+const openLogDir = async () => {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('open_log_dir')
+  } catch (error) {
+    console.error('打开日志目录失败:', error)
   }
 }
 
